@@ -188,13 +188,10 @@ struct global_rq {
 	unsigned long qnr; /* queued not running */
 	cpumask_t cpu_idle_map;
 	bool idle_cpus;
-
-=======
 #ifndef CONFIG_64BIT
 	raw_spinlock_t priodl_lock;
 #endif
 	u64 rq_priodls[NR_CPUS];
-
 #endif
 	int noc; /* num_online_cpus stored and updated when it changes */
 	u64 niffies; /* Nanosecond jiffies */
@@ -246,8 +243,6 @@ static struct global_rq grq ____cacheline_aligned;
 #endif
 
 DEFINE_PER_CPU_SHARED_ALIGNED(struct rq, runqueues);
-
-=======
 #ifdef CONFIG_INTELLI_HOTPLUG
 DEFINE_PER_CPU_SHARED_ALIGNED(struct nr_stats_s, runqueue_stats);
 #endif
@@ -662,7 +657,6 @@ static inline void resched_curr(struct rq *rq)
 	resched_task(rq->curr);
 }
 
-
 #ifdef CONFIG_INTELLI_HOTPLUG
 static inline unsigned int do_avg_nr_running(struct rq *rq)
 {
@@ -941,6 +935,7 @@ EXPORT_SYMBOL_GPL(cpu_nonscaling);
  */
 static inline void activate_idle_task(struct task_struct *p)
 {
+	enqueue_task_head(p);
 	inc_nr_running(p);
 	inc_qnr();
 }
@@ -997,7 +992,6 @@ static void activate_task(struct task_struct *p, struct rq *rq)
 	if (task_contributes_to_load(p))
 		grq.nr_uninterruptible--;
 	enqueue_task(p);
-
 	inc_nr_running(p);
 	inc_qnr();
 }
@@ -1012,7 +1006,6 @@ static inline void deactivate_task(struct task_struct *p)
 {
 	if (task_contributes_to_load(p))
 		grq.nr_uninterruptible++;
-
 	dec_nr_running(p);
 	clear_sticky(p);
 }
@@ -1392,7 +1385,6 @@ static void try_preempt(struct task_struct *p, struct rq *this_rq)
 		u64 rq_priodl;
 
 		rq = cpu_rq(cpu);
-
 #if defined(CONFIG_SMP) && !defined(CONFIG_64BIT)
 		raw_spin_lock(&grq.priodl_lock);
 #endif
@@ -1418,8 +1410,8 @@ static void try_preempt(struct task_struct *p, struct rq *this_rq)
 {
 	if (p->policy == SCHED_IDLEPRIO)
 		return;
-
 	if (can_preempt(p, grq.rq_priodls[0]))
+		resched_curr(uprq);
 }
 #endif /* CONFIG_SMP */
 
@@ -2356,6 +2348,7 @@ static __always_inline bool steal_account_process_tick(void)
 	if (static_key_false(&paravirt_steal_enabled)) {
 		u64 steal;
 		cputime_t steal_ct;
+
 		steal = paravirt_steal_clock(smp_processor_id());
 		steal -= this_rq()->prev_steal_time;
 
@@ -3285,7 +3278,6 @@ static inline void reset_rq_task(struct rq *rq, struct task_struct *p)
 	rq->rq_policy = p->policy;
 	rq->rq_prio = p->prio;
 	rq->rq_deadline = p->deadline;
-
 #if defined(CONFIG_SMP) && !defined(CONFIG_64BIT)
 	raw_spin_lock(&grq.priodl_lock);
 #endif
@@ -3478,7 +3470,6 @@ need_resched:
 		 * this task called schedule() in the past. prev == current
 		 * is still correct, but it can be moved to another cpu/rq.
 		 */
-
 		cpu = smp_processor_id();
 		rq = cpu_rq(cpu);
 		idle = rq->idle;
@@ -4975,7 +4966,6 @@ EXPORT_SYMBOL(yield);
  *	false (0) if we failed to boost the target.
  *	-ESRCH if there's no task to yield to.
  */
-
 int __sched yield_to(struct task_struct *p, bool preempt)
 {
 	struct rq *rq, *p_rq;
@@ -7154,7 +7144,6 @@ void __init sched_init(void)
 #ifndef CONFIG_64BIT
 	raw_spin_lock_init(&grq.priodl_lock);
 #endif
-
 #else
 	uprq = &per_cpu(runqueues, 0);
 #endif
