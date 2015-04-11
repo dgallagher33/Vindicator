@@ -188,6 +188,13 @@ struct global_rq {
 	unsigned long qnr; /* queued not running */
 	cpumask_t cpu_idle_map;
 	bool idle_cpus;
+
+=======
+#ifndef CONFIG_64BIT
+	raw_spinlock_t priodl_lock;
+#endif
+	u64 rq_priodls[NR_CPUS];
+
 #endif
 	int noc; /* num_online_cpus stored and updated when it changes */
 	u64 niffies; /* Nanosecond jiffies */
@@ -239,6 +246,12 @@ static struct global_rq grq ____cacheline_aligned;
 #endif
 
 DEFINE_PER_CPU_SHARED_ALIGNED(struct rq, runqueues);
+
+=======
+#ifdef CONFIG_INTELLI_HOTPLUG
+DEFINE_PER_CPU_SHARED_ALIGNED(struct nr_stats_s, runqueue_stats);
+#endif
+
 static DEFINE_MUTEX(sched_hotcpu_mutex);
 
 #ifdef CONFIG_SMP
@@ -649,6 +662,56 @@ static inline void resched_curr(struct rq *rq)
 	resched_task(rq->curr);
 }
 
+
+#ifdef CONFIG_INTELLI_HOTPLUG
+static inline unsigned int do_avg_nr_running(struct rq *rq)
+{
+	struct nr_stats_s *nr_stats = &per_cpu(runqueue_stats, rq->cpu);
+	unsigned int ave_nr_running = nr_stats->ave_nr_running;
+	s64 nr, deltax;
+
+	deltax = rq->clock_task - nr_stats->nr_last_stamp;
+	nr = NR_AVE_SCALE(grq.nr_running);
+
+	if (deltax > NR_AVE_PERIOD)
+		ave_nr_running = nr;
+	else
+		ave_nr_running +=
+			NR_AVE_DIV_PERIOD(deltax * (nr - ave_nr_running));
+
+	return ave_nr_running;
+}
+#endif
+
+static inline void inc_nr_running(struct task_struct *p)
+{
+#ifdef CONFIG_INTELLI_HOTPLUG
+	struct rq *rq = task_rq(p);
+	struct nr_stats_s *nr_stats = &per_cpu(runqueue_stats, rq->cpu);
+	write_seqcount_begin(&nr_stats->ave_seqcnt);
+	nr_stats->ave_nr_running = do_avg_nr_running(rq);
+	nr_stats->nr_last_stamp = rq->clock_task;
+#endif
+	grq.nr_running++;
+#ifdef CONFIG_INTELLI_HOTPLUG
+	write_seqcount_end(&nr_stats->ave_seqcnt);
+#endif
+}
+
+static inline void dec_nr_running(struct task_struct *p) {
+#ifdef CONFIG_INTELLI_HOTPLUG
+	struct rq *rq = task_rq(p);
+	struct nr_stats_s *nr_stats = &per_cpu(runqueue_stats, rq->cpu);
+	write_seqcount_begin(&nr_stats->ave_seqcnt);
+	nr_stats->ave_nr_running = do_avg_nr_running(rq);
+	nr_stats->nr_last_stamp = rq->clock_task;
+#endif
+	grq.nr_running--;
+#ifdef CONFIG_INTELLI_HOTPLUG
+	write_seqcount_end(&nr_stats->ave_seqcnt);
+#endif
+}
+
 #ifdef CONFIG_SMP
 /*
  * qnr is the "queued but not running" count which is the total number of
@@ -878,8 +941,7 @@ EXPORT_SYMBOL_GPL(cpu_nonscaling);
  */
 static inline void activate_idle_task(struct task_struct *p)
 {
-	enqueue_task_head(p);
-	grq.nr_running++;
+	inc_nr_running(p);
 	inc_qnr();
 }
 
@@ -935,7 +997,8 @@ static void activate_task(struct task_struct *p, struct rq *rq)
 	if (task_contributes_to_load(p))
 		grq.nr_uninterruptible--;
 	enqueue_task(p);
-	grq.nr_running++;
+
+	inc_nr_running(p);
 	inc_qnr();
 }
 
@@ -949,7 +1012,8 @@ static inline void deactivate_task(struct task_struct *p)
 {
 	if (task_contributes_to_load(p))
 		grq.nr_uninterruptible++;
-	grq.nr_running--;
+
+	dec_nr_running(p);
 	clear_sticky(p);
 }
 
@@ -1315,13 +1379,27 @@ static void try_preempt(struct task_struct *p, struct rq *this_rq)
 	cpu = cpumask_first(&tmp);
 	rq = cpu_rq(cpu);
 	highest_prio_rq = rq;
-	highest_priodl = rq->rq_priodl;
+
+#if defined(CONFIG_SMP) && !defined(CONFIG_64BIT)
+	raw_spin_lock(&grq.priodl_lock);
+#endif
+	highest_priodl = grq.rq_priodls[cpu];
+#if defined(CONFIG_SMP) && !defined(CONFIG_64BIT)
+	raw_spin_unlock(&grq.priodl_lock);
+#endif
 
 	for (;cpu = cpumask_next(cpu, &tmp), cpu < nr_cpu_ids;) {
 		u64 rq_priodl;
 
 		rq = cpu_rq(cpu);
-		rq_priodl = rq->rq_priodl;
+
+#if defined(CONFIG_SMP) && !defined(CONFIG_64BIT)
+		raw_spin_lock(&grq.priodl_lock);
+#endif
+		rq_priodl = grq.rq_priodls[cpu];
+#if defined(CONFIG_SMP) && !defined(CONFIG_64BIT)
+		raw_spin_unlock(&grq.priodl_lock);
+#endif
 		if (rq_priodl > highest_priodl ) {
 			highest_priodl = rq_priodl;
 		}
@@ -1340,8 +1418,8 @@ static void try_preempt(struct task_struct *p, struct rq *this_rq)
 {
 	if (p->policy == SCHED_IDLEPRIO)
 		return;
-	if (can_preempt(p, uprq->rq_priodl))
-		resched_curr(uprq);
+
+	if (can_preempt(p, grq.rq_priodls[0]))
 }
 #endif /* CONFIG_SMP */
 
@@ -1945,6 +2023,61 @@ unsigned long nr_iowait(void)
 	return sum;
 }
 
+#ifdef CONFIG_INTELLI_HOTPLUG
+unsigned long avg_nr_running(void)
+{
+	unsigned long i, sum = 0;
+	unsigned int seqcnt, ave_nr_running;
+
+	for_each_online_cpu(i) {
+		struct nr_stats_s *stats = &per_cpu(runqueue_stats, i);
+		struct rq *q = cpu_rq(i);
+
+		/*
+		 * Update average to avoid reading stalled value if there were
+		 * no run-queue changes for a long time. On the other hand if
+		 * the changes are happening right now, just read current value
+		 * directly.
+		 */
+		seqcnt = read_seqcount_begin(&stats->ave_seqcnt);
+		ave_nr_running = do_avg_nr_running(q);
+		if (read_seqcount_retry(&stats->ave_seqcnt, seqcnt)) {
+			read_seqcount_begin(&stats->ave_seqcnt);
+			ave_nr_running = stats->ave_nr_running;
+		}
+
+		sum += ave_nr_running;
+	}
+
+	return sum;
+}
+EXPORT_SYMBOL(avg_nr_running);
+
+unsigned long avg_cpu_nr_running(unsigned int cpu)
+{
+	unsigned int seqcnt, ave_nr_running;
+
+	struct nr_stats_s *stats = &per_cpu(runqueue_stats, cpu);
+	struct rq *q = cpu_rq(cpu);
+
+	/*
+	 * Update average to avoid reading stalled value if there were
+	 * no run-queue changes for a long time. On the other hand if
+	 * the changes are happening right now, just read current value
+	 * directly.
+	 */
+	seqcnt = read_seqcount_begin(&stats->ave_seqcnt);
+	ave_nr_running = do_avg_nr_running(q);
+	if (read_seqcount_retry(&stats->ave_seqcnt, seqcnt)) {
+		read_seqcount_begin(&stats->ave_seqcnt);
+		ave_nr_running = stats->ave_nr_running;
+	}
+
+	return ave_nr_running;
+}
+EXPORT_SYMBOL(avg_cpu_nr_running);
+#endif
+
 unsigned long nr_iowait_cpu(int cpu)
 {
 	struct rq *this = cpu_rq(cpu);
@@ -2175,15 +2308,11 @@ static void update_rq_clock_task(struct rq *rq, s64 delta)
 #ifdef CONFIG_PARAVIRT_TIME_ACCOUNTING
 	if (static_key_false((&paravirt_steal_rq_enabled))) {
 		s64 steal = paravirt_steal_clock(cpu_of(rq));
-		u64 st;
 
 		steal -= rq->prev_steal_time_rq;
 
 		if (unlikely(steal > delta))
 			steal = delta;
-
-		st = steal_ticks(steal);
-		steal = st * TICK_NSEC;
 
 		rq->prev_steal_time_rq += steal;
 
@@ -2225,16 +2354,21 @@ static __always_inline bool steal_account_process_tick(void)
 {
 #ifdef CONFIG_PARAVIRT
 	if (static_key_false(&paravirt_steal_enabled)) {
-		u64 steal, st = 0;
-
+		u64 steal;
+		cputime_t steal_ct;
 		steal = paravirt_steal_clock(smp_processor_id());
 		steal -= this_rq()->prev_steal_time;
 
-		st = steal_ticks(steal);
-		this_rq()->prev_steal_time += st * TICK_NSEC;
+		/*
+		 * cputime_t may be less precise than nsecs (eg: if it's
+		 * based on jiffies). Lets cast the result to cputime
+		 * granularity and account the rest on the next rounds.
+		 */
+		steal_ct = nsecs_to_cputime(steal);
+		this_rq()->prev_steal_time += cputime_to_nsecs(steal_ct);
 
-		account_steal_time(st);
-		return st;
+		account_steal_time(steal_ct);
+		return steal_ct;
 	}
 #endif
 	return false;
@@ -3135,7 +3269,14 @@ static inline void set_rq_task(struct rq *rq, struct task_struct *p)
 	rq->rq_last_ran = p->last_ran = rq->clock_task;
 	rq->rq_policy = p->policy;
 	rq->rq_prio = p->prio;
-	rq->rq_priodl = p->priodl;
+
+#if defined(CONFIG_SMP) && !defined(CONFIG_64BIT)
+	raw_spin_lock(&grq.priodl_lock);
+#endif
+	grq.rq_priodls[cpu_of(rq)] = p->priodl;
+#if defined(CONFIG_SMP) && !defined(CONFIG_64BIT)
+	raw_spin_unlock(&grq.priodl_lock);
+#endif
 	rq->rq_running = (p != rq->idle);
 }
 
@@ -3144,7 +3285,14 @@ static inline void reset_rq_task(struct rq *rq, struct task_struct *p)
 	rq->rq_policy = p->policy;
 	rq->rq_prio = p->prio;
 	rq->rq_deadline = p->deadline;
-	rq->rq_priodl = p->priodl;
+
+#if defined(CONFIG_SMP) && !defined(CONFIG_64BIT)
+	raw_spin_lock(&grq.priodl_lock);
+#endif
+	grq.rq_priodls[cpu_of(rq)] = p->priodl;
+#if defined(CONFIG_SMP) && !defined(CONFIG_64BIT)
+	raw_spin_unlock(&grq.priodl_lock);
+#endif
 }
 
 /*
@@ -3330,11 +3478,10 @@ need_resched:
 		 * this task called schedule() in the past. prev == current
 		 * is still correct, but it can be moved to another cpu/rq.
 		 */
-		/*
+
 		cpu = smp_processor_id();
 		rq = cpu_rq(cpu);
 		idle = rq->idle;
-		*/
 	} else
 		grq_unlock_irq();
 
@@ -4828,7 +4975,8 @@ EXPORT_SYMBOL(yield);
  *	false (0) if we failed to boost the target.
  *	-ESRCH if there's no task to yield to.
  */
-bool __sched yield_to(struct task_struct *p, bool preempt)
+
+int __sched yield_to(struct task_struct *p, bool preempt)
 {
 	struct rq *rq, *p_rq;
 	unsigned long flags;
@@ -5099,7 +5247,6 @@ void init_idle(struct task_struct *idle, int cpu)
 	/* Setting prio to illegal value shouldn't matter when never queued */
 	idle->prio = PRIO_LIMIT;
 	idle->deadline = 0ULL;
-	update_task_priodl(idle);
 	set_rq_task(rq, idle);
 	do_set_cpus_allowed(idle, &cpumask_of_cpu(cpu));
 	/* Silence PROVE_RCU */
@@ -7004,6 +7151,10 @@ void __init sched_init(void)
 	init_defrootdomain();
 	grq.qnr = grq.idle_cpus = 0;
 	cpumask_clear(&grq.cpu_idle_map);
+#ifndef CONFIG_64BIT
+	raw_spin_lock_init(&grq.priodl_lock);
+#endif
+
 #else
 	uprq = &per_cpu(runqueues, 0);
 #endif
